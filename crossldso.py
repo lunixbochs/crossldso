@@ -255,7 +255,7 @@ class CrossElf64:
         dyn = Struct('Dyn', '<qQ', 'tag', 'val')
         rel = Struct('Rel', '<QQ', 'off', 'info')
         rela = Struct('Rela', '<QQQ', 'off', 'info', 'addend')
-        sym = Struct('Sym', '<IBBHQQ', 'name_off', 'info', 'other', 'shndx', 'val', 'size')
+        sym = Struct('Sym', '<IBBHQQ', 'nameoff', 'info', 'other', 'shndx', 'val', 'size')
         addr = struct.Struct('<Q')
 
     def __init__(self, fileobj=None):
@@ -269,15 +269,15 @@ class CrossElf64:
         if isinstance(fileobj, str):
             self.path = fileobj
             fileobj = open(self.path, 'rb')
-        f = self.f = fileobj
+        self.f = f = fileobj
 
         codec = self.codec
         # ident
-        ident = self.ident = codec.file_ident.read_from(f)
+        self.ident = ident = codec.file_ident.read_from(f)
         assert(ident.magic == b'\x7fELF' and ident.elf_class == ELFCLASS64 and ident.elf_data == ELFDATA2LSB and ident.file_version == EV_CURRENT)
 
         # file header
-        fh = self.fh = codec.file_header.read_from(f)
+        self.fh = fh = codec.file_header.read_from(f)
 
         # program headers
         if fh.phoff > 0 and fh.phnum > 0:
@@ -314,7 +314,7 @@ class CrossElf64:
 
         # parse DYN
         self.dyn = []
-        dynd = defaultdict(list)
+        self.dynd = dynd = defaultdict(list)
         for ph in self.ph:
             if ph.type == PT.DYNAMIC:
                 f.seek(ph.off)
@@ -378,6 +378,10 @@ class CrossElf64:
         # map and relocate library
         self.base = self.dlopen()
 
+    def symbol_name(self, sh):
+        name = self.strtab[sh.nameoff:].split(b'\0', 1)[0]
+        return name.decode('utf8')
+
     def section_name(self, sh):
         name = self.shstrtab[sh.nameoff:].split(b'\0', 1)[0]
         return name.decode('utf8')
@@ -401,7 +405,7 @@ class CrossElf64:
 
         # 3. link symbols
         for sym in self.symtab:
-            name = self.strtab[sym.name_off:].split(b'\0', 1)[0].decode('utf8')
+            name = self.symbol_name(sym)
 
             # FIXME: x86_64 specific
             sym_bind = STB(sym.info >> 4)
@@ -417,8 +421,7 @@ class CrossElf64:
                 addr = self.resolve(name)
 
             self.link_map[name] = addr
-            print(f"{section_name:10} {name:30} {str(sym_bind):12} {str(sym_type):12} {str(STV(sym.other)):12} {addr}")
-            # print(section_name.ljust(10), name.ljust(30), STB(sym_bind), STT(sym_type), STV(sym.other), addr, hex(sym.val))
+            # print(f"{section_name:10} {name:30} {str(sym_bind):12} {str(sym_type):12} {str(STV(sym.other)):12} {addr}")
 
         # 4. apply relocations
         for rel in self.rel:
@@ -426,14 +429,28 @@ class CrossElf64:
             rel_sym = rel.info >> 32
             rel_type = rel.info & 0xff
             if rel_type == R_AMD64.RELATIVE:
-                pass
+                ffi.cast('uint64_t *', base + rel.off)[0] = ffi.cast('uint64_t', base + rel.addend)
             elif rel_type == R_AMD64.JUMP_SLOT:
-                pass
+                sym_name = self.symbol_name(self.symtab[rel_sym])
+                ffi.cast('uint64_t *', base + rel.off)[0] = ffi.cast('uint64_t', self.resolve(sym_name))
             else:
                 raise Exception(f"unsupported relocation type: {rel_type}")
             # print(rel_sym, rel_type)
 
-        # 5. mprotect each segment
+        '''
+        # 5. directly wire all PLT symbols
+        for sh in self.sh:
+            if self.section_name(sh) == '.plt':
+                f.seek(sh.off)
+                print('plt', sh)
+                import binascii
+                for i in range(0, sh.size, sh.entsize):
+                    print('- {}'.format(binascii.hexlify(f.read(sh.entsize)).decode('utf8')))
+                print()
+                break
+        '''
+
+        # 6. mprotect each segment
         for ph in loads:
             off = ph.vaddr-low_addr
             end = align(off + ph.memsize)
@@ -487,10 +504,8 @@ class CrossElf64:
             if name.startswith('function '):
                 name = name.split(' ', 1)[1]
                 sig = decl[0].c_name_with_marker.replace('&', '', 1)
-                if name in self.link_map:
-                    setattr(lib, name, ffi.cast(sig, self.link_map[name]))
-                else:
-                    raise NameError(name)
+                addr = self.resolve(name)
+                setattr(lib, name, ffi.cast(sig, addr))
         return lib
 
 def dlopen(path, flags=0):
@@ -506,10 +521,31 @@ def cffi_dlopen(ffi, path, flags=0):
 # pv_cheetah_frame_length = ffi.cast('int (*)()', elf.resolve('pv_cheetah_frame_length'))
 # print(pv_sample_rate(), pv_cheetah_frame_length())
 
-
 ffi2 = FFI()
 ffi2.cdef(r'''
-int pv_sample_rate();
+int pv_sample_rate(void);
+
+typedef enum {
+    PV_STATUS_SUCCESS = 0,
+    PV_STATUS_OUT_OF_MEMORY,
+    PV_STATUS_IO_ERROR,
+    PV_STATUS_INVALID_ARGUMENT,
+    PV_STATUS_STOP_ITERATION,
+    PV_STATUS_KEY_ERROR,
+} pv_status_t;
+
+typedef struct pv_cheetah_object pv_cheetah_object_t;
+pv_status_t pv_cheetah_init(
+    const char *acoustic_model_file_path,
+    const char *language_model_file_path,
+    const char *license_file_path,
+    pv_cheetah_object_t **object);
+void pv_cheetah_delete(pv_cheetah_object_t *object);
+pv_status_t pv_cheetah_process(pv_cheetah_object_t *object, const int16_t *pcm);
+pv_status_t pv_cheetah_transcribe(pv_cheetah_object_t *object, char **transcription);
+const char *pv_cheetah_version(void);
+int pv_cheetah_frame_length(void);
 ''')
 lib2 = cffi_dlopen(ffi2, '/Users/aegis/build/cheetah/lib/linux/x86_64/libpv_cheetah.so')
-print(lib2.pv_sample_rate())
+print('sample rate: ', lib2.pv_sample_rate())
+print('frame length:', lib2.pv_cheetah_frame_length())
