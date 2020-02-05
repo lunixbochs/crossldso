@@ -16,17 +16,17 @@ MAP_PRIVATE = 0x02
 MAP_ANONYMOUS = 0x1000
 RTLD_NEXT = -1
 
-ffi = FFI()
-ffi.cdef(r'''
+libc_ffi = FFI()
+libc_ffi.cdef(r'''
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, ssize_t offset);
 int mprotect(void *addr, size_t len, int prot);
 int munmap(void *addr, size_t len);
 void *dlsym(void *handle, const char *symbol);
 ''')
-lib = ffi.dlopen(None)
+lib = libc_ffi.dlopen(None)
 
 def _libc_dlsym(name):
-    return lib.dlsym(ffi.cast('void *', RTLD_NEXT), name.encode('utf8'))
+    return lib.dlsym(libc_ffi.cast('void *', RTLD_NEXT), name.encode('utf8'))
 
 ALIGN = 0x1000
 def align(addr, *, by=0):
@@ -35,10 +35,10 @@ def align(addr, *, by=0):
 
 def mmap(addr, size, prot, *, flags=MAP_PRIVATE, fileobj=None, offset=0):
     if addr is None:
-        addr = ffi.NULL
+        addr = libc_ffi.NULL
     elif addr & (ALIGN-1) or size & (ALIGN-1):
         raise MemoryError('memory mapping not aligned')
-    addr = ffi.cast('void *', addr)
+    addr = libc_ffi.cast('void *', addr)
 
     if fileobj is not None:
         fd = fileobj.fileno()
@@ -47,7 +47,7 @@ def mmap(addr, size, prot, *, flags=MAP_PRIVATE, fileobj=None, offset=0):
         flags |= MAP_ANONYMOUS
 
     page = lib.mmap(addr, size, prot, flags, fd, offset)
-    if ffi.cast('ssize_t', page) == -1:
+    if libc_ffi.cast('ssize_t', page) == -1:
         raise MemoryError('failed to map memory')
     return page
 
@@ -58,7 +58,7 @@ def munmap(addr, size):
         raise MemoryError('failed to unmap memory')
 
 def mprotect(addr, size, prot):
-    if int(ffi.cast('uintptr_t', addr)) & (ALIGN-1) or size & (ALIGN-1):
+    if int(libc_ffi.cast('uintptr_t', addr)) & (ALIGN-1) or size & (ALIGN-1):
         raise MemoryError('memory mapping not aligned')
     if lib.mprotect(addr, size, prot):
         raise MemoryError('failed to protect memory')
@@ -401,7 +401,7 @@ class CrossElf64:
         for ph in loads:
             f.seek(ph.off)
             off = ph.vaddr-low_addr
-            f.readinto(ffi.buffer(base + off, ph.filesize))
+            f.readinto(libc_ffi.buffer(base + off, ph.filesize))
 
         # 3. link symbols
         for sym in self.symtab:
@@ -429,10 +429,10 @@ class CrossElf64:
             rel_sym = rel.info >> 32
             rel_type = rel.info & 0xff
             if rel_type == R_AMD64.RELATIVE:
-                ffi.cast('uint64_t *', base + rel.off)[0] = ffi.cast('uint64_t', base + rel.addend)
+                libc_ffi.cast('uint64_t *', base + rel.off)[0] = libc_ffi.cast('uint64_t', base + rel.addend)
             elif rel_type == R_AMD64.JUMP_SLOT:
                 sym_name = self.symbol_name(self.symtab[rel_sym])
-                ffi.cast('uint64_t *', base + rel.off)[0] = ffi.cast('uint64_t', self.resolve(sym_name))
+                libc_ffi.cast('uint64_t *', base + rel.off)[0] = libc_ffi.cast('uint64_t', self.resolve(sym_name))
             else:
                 raise Exception(f"unsupported relocation type: {rel_type}")
             # print(rel_sym, rel_type)
@@ -472,7 +472,7 @@ class CrossElf64:
             raise NameError(name)
 
         if name == '__ctype_toupper_loc':
-            toupper = ffi.new('char[]', 128 * 3)
+            toupper = libc_ffi.new('char[]', 128 * 3)
             for i in range(256):
                 try:
                     toupper[128 + i] = chr(i).upper()[0].encode('ascii')
@@ -498,14 +498,14 @@ class CrossElf64:
         addr = _libc_dlsym(name)
         return addr
 
-    def cffi_dlopen(self, ffi):
+    def cffi_dlopen(self, libc_ffi):
         lib = CrossElfLib(self)
-        for name, decl in ffi._parser._declarations.items():
+        for name, decl in libc_ffi._parser._declarations.items():
             if name.startswith('function '):
                 name = name.split(' ', 1)[1]
                 sig = decl[0].c_name_with_marker.replace('&', '', 1)
                 addr = self.resolve(name)
-                setattr(lib, name, ffi.cast(sig, addr))
+                setattr(lib, name, libc_ffi.cast(sig, addr))
         return lib
 
 def dlopen(path, flags=0):
@@ -514,38 +514,10 @@ def dlopen(path, flags=0):
 def cffi_dlopen(ffi, path, flags=0):
     return CrossElf64(path).cffi_dlopen(ffi)
 
-# addr = mmap(None, 0x1000, PROT_ALL)
-
-# elf = dlopen('/Users/aegis/build/cheetah/lib/linux/x86_64/libpv_cheetah.so')
-# pv_sample_rate = ffi.cast('int (*)()', elf.resolve('pv_sample_rate'))
-# pv_cheetah_frame_length = ffi.cast('int (*)()', elf.resolve('pv_cheetah_frame_length'))
-# print(pv_sample_rate(), pv_cheetah_frame_length())
-
-ffi2 = FFI()
-ffi2.cdef(r'''
-int pv_sample_rate(void);
-
-typedef enum {
-    PV_STATUS_SUCCESS = 0,
-    PV_STATUS_OUT_OF_MEMORY,
-    PV_STATUS_IO_ERROR,
-    PV_STATUS_INVALID_ARGUMENT,
-    PV_STATUS_STOP_ITERATION,
-    PV_STATUS_KEY_ERROR,
-} pv_status_t;
-
-typedef struct pv_cheetah_object pv_cheetah_object_t;
-pv_status_t pv_cheetah_init(
-    const char *acoustic_model_file_path,
-    const char *language_model_file_path,
-    const char *license_file_path,
-    pv_cheetah_object_t **object);
-void pv_cheetah_delete(pv_cheetah_object_t *object);
-pv_status_t pv_cheetah_process(pv_cheetah_object_t *object, const int16_t *pcm);
-pv_status_t pv_cheetah_transcribe(pv_cheetah_object_t *object, char **transcription);
-const char *pv_cheetah_version(void);
-int pv_cheetah_frame_length(void);
-''')
-lib2 = cffi_dlopen(ffi2, '/Users/aegis/build/cheetah/lib/linux/x86_64/libpv_cheetah.so')
-print('sample rate: ', lib2.pv_sample_rate())
-print('frame length:', lib2.pv_cheetah_frame_length())
+if __name__ == '__main__':
+    ffi = FFI()
+    ffi.cdef(r'''
+    // put some definitions here
+    ''')
+    lib = cffi_dlopen(ffi, '/path/to/library')
+    lib.call_something()
